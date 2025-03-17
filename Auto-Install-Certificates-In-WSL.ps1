@@ -1,36 +1,35 @@
 <#
 .SYNOPSIS
     This script searches for certificates with a specific description pattern, exports them, installs them in WSL, and checks the response using curl.
-
+    In case Script execution is not allowed on the system, you can run the following command to allow the script to run:
+    powershell -ExecutionPolicy Unrestricted
 .DESCRIPTION
     The script searches for certificates with a specific description pattern. It exports each certificate, installs them in WSL, and checks the response using curl. If the response is not correct, it tries the next certificate from the results. If the list is exhausted and WSL still responds with an incorrect answer, it throws an error.
-
 .PARAMETER DescriptionPattern
     The pattern to search for in the certificate description. Default is "CA".
-
 .PARAMETER ExcludeIssuers
     An array of issuer names to exclude from the results. Default is an array of common built-in certificate issuers.
-
 .PARAMETER WSLDistro
-    The WSL distribution to install the certificate in. Default is "Ubuntu".
-
+    The WSL distribution to install the certificate in. Default is the WSL distro which is marked as Default in Windows.
 .PARAMETER UpdateCommand
     The command to update the CA certificates. Default is the value from the $wslDistros array.
-
 .PARAMETER Verbose
     Enables verbose output.
-
+.PARAMETER AllCertificates
+    When specified, installs all matching certificates even if a working certificate is found. By default, the script stops after finding the first working certificate.
 .EXAMPLE
     .\Auto-Install-CertificatesInWSL.ps1 -Verbose
-
 .EXAMPLE
     .\Auto-Install-CertificatesInWSL.ps1 -DescriptionPattern "CA" -ExcludeIssuers @("DigiCert", "thawte") -WSLDistro "Ubuntu" -Verbose
-
+.EXAMPLE
+    .\Auto-Install-CertificatesInWSL.ps1 -AllCertificates
+    Installs all matching certificates regardless of verification status.
 .LINK
     Related topic: https://github.com/microsoft/WSL/issues/3161
-
 .LINK
     Source of "$wslDistros" array: https://stackoverflow.com/a/77672453
+.LINK
+    Original script: https://gist.github.com/emilwojcik93/7eb1e172f8bb038e324c6e4a7f4ccaaa
 #>
 
 param (
@@ -60,7 +59,8 @@ param (
     ),
     [string]$WSLDistro,
     [string]$UpdateCommand,
-    [switch]$Verbose
+    [switch]$Verbose,
+    [switch]$AllCertificates
 )
 
 if ($Verbose) {
@@ -75,6 +75,8 @@ $wslDistros = @{
     "CoreOS" = @{ Path = "/etc/pki/ca-trust/source/anchors/"; Command = "update-ca-certificates"; Install = "Built into the system" }
     "Debian" = @{ Path = "/usr/local/share/ca-certificates/"; Command = "update-ca-certificates"; Install = "apt-get install -y ca-certificates" }
     "Fedora" = @{ Path = "/etc/pki/ca-trust/source/anchors/"; Command = "update-ca-trust extract"; Install = "dnf install ca-certificates" }
+    # copy from Fedora for podman WSL distro
+    "podman-machine-default" = @{ Path = "/etc/pki/ca-trust/source/anchors/"; Command = "update-ca-trust extract"; Install = "dnf install ca-certificates" }
     "RedHat" = @{ Path = "/etc/pki/ca-trust/source/anchors/"; Command = "update-ca-trust extract"; Install = "yum install ca-certificates" }
     "SUSE" = @{ Path = "/etc/pki/trust/anchors/"; Command = "update-ca-certificates"; Install = "zypper install ca-certificates" }
     "Ubuntu" = @{ Path = "/usr/local/share/ca-certificates/"; Command = "update-ca-certificates"; Install = "apt-get install -y ca-certificates" }
@@ -136,7 +138,7 @@ function Search-Certificates {
     )
 
     $storeLocations = @("LocalMachine", "CurrentUser")
-    $storeNames = @("My", "Root", "CA", "AuthRoot", "TrustedPublisher", "TrustedPeople", "Disallowed")
+    $storeNames = @("My", "Root", "CA", "AuthRoot", "TrustedPublisher", "TrustedPeople", "Disallowed", "SmartCardRoot", "Trust", "Request")
 
     $results = @()
     foreach ($storeLocation in $storeLocations) {
@@ -148,6 +150,10 @@ function Search-Certificates {
             foreach ($cert in $certificates) {
                 if ($cert.Subject -like "*$DescriptionPattern*" -and $cert.Issuer -notmatch ($ExcludeIssuers -join "|")) {
                     Write-Verbose "Matched certificate: $($cert.PSPath)"
+                    $issuerCN = ($cert.Issuer -match "CN=([^,]+)") | Out-Null; $issuerCN = $matches[1] -replace " ", "_"
+                    Write-Verbose "Issuer CN: $issuerCN"
+                    Write-Verbose "Issuer: $($cert.Issuer)"
+                    Write-Verbose "Subject: $($cert.Subject)"
                     $results += $cert
                 }
             }
@@ -257,13 +263,34 @@ function Test-CertificateInWSL {
     return $output
 }
 
+function Test-AllCertificatesInWSL {
+    param (
+        [string]$WSLDistro
+    )
+    
+    $success = $false
+    foreach ($address in $addresses) {
+        $response = Test-CertificateInWSL -WSLDistro $WSLDistro -Address $address
+        Write-Verbose "Response from Test-CertificateInWSL for ${address}: $response"
+        if ($response -ge 200 -and $response -lt 400) {
+            Write-Host "Certificate verification successful for ${address}."
+            $success = $true
+            break
+        } else {
+            Write-Warning "Certificate verification failed for ${address}."
+        }
+    }
+    return $success
+}
+
 function Main {
     param (
         [string]$DescriptionPattern,
         [string[]]$ExcludeIssuers,
         [string]$WSLDistro,
         [string]$UpdateCommand,
-        [switch]$Verbose
+        [switch]$Verbose,
+        [switch]$AllCertificates
     )
 
     if (-not (Test-WSL)) {
@@ -295,9 +322,9 @@ function Main {
     $certificates = Search-Certificates -DescriptionPattern $DescriptionPattern -ExcludeIssuers $ExcludeIssuers
 
     foreach ($cert in $certificates) {
-        # Extract CN value from issuer and replace spaces with underscores
-        $issuerCN = ($cert.Issuer -match "CN=([^,]+)") | Out-Null; $issuerCN = $matches[1] -replace " ", "_"
-        $certFileName = "$issuerCN.crt"
+        # Extract CN value from subject and replace spaces with underscores
+        $subjectCN = ($cert.Subject -match "CN=([^,]+)") | Out-Null; $subjectCN = $matches[1] -replace " ", "_"
+        $certFileName = "$subjectCN.crt"
         $certFilePath = Join-Path -Path $env:TEMP -ChildPath $certFileName
     
         # Export certificate to file
@@ -309,31 +336,32 @@ function Main {
         # Install certificate in WSL
         Install-CertificateInWSL -CertFilePath $certFilePath -WSLDistro $WSLDistro -UpdateCommand $UpdateCommand -CertPath $certPath
     
-        # Check certificate in WSL for each address
-        $success = $false
-        foreach ($address in $addresses) {
-            $response = Test-CertificateInWSL -WSLDistro $WSLDistro -Address $address
-            Write-Verbose "Response from Test-CertificateInWSL for ${address}: $response"
-            if ($response -ge 200 -and $response -lt 400) {
-                Write-Output "Certificate installed and verified successfully for ${address}."
-                $success = $true
-                break
-            } else {
-                Write-Warning "Certificate did not pass verification for ${address}."
-            }
+        if ($AllCertificates) {
+            Write-Output "Certificate installed. Verification will be performed after all certificates are installed."
+            continue
         }
     
+        # Check certificate in WSL for each address
+        $success = Test-AllCertificatesInWSL -WSLDistro $WSLDistro
         if ($success) {
-            Write-Output "Certificate installed and verified successfully for at least one address."
+            Write-Output "Certificate installed and verified successfully."
             return
         } else {
-            Write-Warning "Certificate verification failed for all addresses. Trying next certificate."
+            Write-Warning "Certificate verification failed. Trying next certificate."
             Remove-OldCertificateFromWSL -CertFileName $certFileName -WSLDistro $WSLDistro
         }
     }
     
-    throw "No valid certificate found that passes verification."
+    if ($AllCertificates) {
+        $success = Test-AllCertificatesInWSL -WSLDistro $WSLDistro
+        if (-not $success) {
+            throw "Verification failed after installing all certificates."
+        }
+        Write-Output "All certificates installed and verification successful."
+    } else {
+        throw "No valid certificate found that passes verification."
+    }
 }
 
 # Call the main function with parameters
-Main -DescriptionPattern $DescriptionPattern -ExcludeIssuers $ExcludeIssuers -WSLDistro $WSLDistro -UpdateCommand $UpdateCommand -Verbose:$Verbose
+Main -DescriptionPattern $DescriptionPattern -ExcludeIssuers $ExcludeIssuers -WSLDistro $WSLDistro -UpdateCommand $UpdateCommand -Verbose:$Verbose -AllCertificates:$AllCertificates
