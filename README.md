@@ -12,7 +12,7 @@ Based on this [gist](https://gist.github.com/emilwojcik93/7eb1e172f8bb038e324c6e
 ## Changes
 - Use Certificate Subject instead of Issuer as certificate identifier
 - add "AllCertificates" Parameter to just load all of the found certificates instead of stopping after the first successfull one
-- add podman-machine-default (basically fedora) as possible WSL distro
+- add podman-machine-default (basically fedora) as possible WSL distro to fix WSL based podman machines, which come as part of podman desktop
 
 ## Usage
 - Download Auto-Install-Certificates-In-WSL.ps1
